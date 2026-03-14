@@ -1,11 +1,22 @@
 # ESPHome Lab
 
-Colección de proyectos, pruebas y configuraciones relacionadas con ESPHome.
+Repositorio temático con proyectos y configuraciones relacionados con **ESPHome**, organizados por subproyectos independientes.
 
 ## Subproyectos
 
-- `armario-fan/` — Controlador de ventiladores para armario con ESP32, ESPHome y control PID.
+### [`armario-fan`](./armario-fan/)
+Controlador de ventiladores para armario con **ESP32**, **ESPHome** y **control PID**, con modo manual/automático y monitorización desde Home Assistant.
+
+## Objetivo del repositorio
+
+Agrupar en un único sitio distintos proyectos basados en ESPHome, manteniendo cada uno en su propia carpeta con su documentación y configuración.
 
 ## Estructura
 
-Cada subproyecto vive en su propia carpeta e incluye su configuración, documentación y recursos asociados.
+```text
+.
+├── .gitignore
+├── README.md
+└── armario-fan/
+    ├── README.md
+    └── armario-fan.yaml
