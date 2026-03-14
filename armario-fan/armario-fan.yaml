@@ -1,0 +1,953 @@
+################################################################################
+# CONTROLADOR DE VENTILADORES - ARMARIO
+# Dispositivo: ESP32 (esp32dev) con framework ESP-IDF
+#
+# Basado en el trabajo original de Patrick Collins:
+#   https://github.com/patrickcollins12/esphome-fan-controller/blob/master/console-fan.yaml
+#
+# DIFERENCIAS PRINCIPALES RESPECTO AL ORIGINAL:
+#
+#   1. DOBLE VENTILADOR: El original controla un único ventilador. Aquí se
+#      controlan dos ventiladores (Fan1 y Fan2) con controladores PID
+#      totalmente independientes pero compartiendo el mismo sensor de
+#      temperatura importado desde Home Assistant.
+#
+#   2. SENSOR EXTERNO (HA): El original usa un sensor DHT11 local conectado
+#      directamente al ESP32 (GPIO33). Aquí los sensores de temperatura y
+#      humedad se importan desde Home Assistant mediante la plataforma
+#      'homeassistant', lo que permite reutilizar un sensor ya existente en
+#      la red sin cables adicionales al ESP32.
+#
+#   3. ARQUITECTURA PROXY OUTPUT: El original conecta el PID directamente
+#      al output LEDC. Aquí se interpone un "proxy output" de tipo template
+#      que permite:
+#        a) Distinguir entre modo manual y automático
+#        b) Aplicar límites de velocidad mínima/máxima configurables en
+#           tiempo real (sin recompilar) para el modo automático
+#      Esto da mucha más flexibilidad operacional.
+#
+#   4. LÍMITES DE VELOCIDAD AJUSTABLES: Cuatro entidades 'number' adicionales
+#      permiten configurar desde HA los límites mín/máx de cada ventilador
+#      cuando están en modo automático (PID). En el original no existe este
+#      concepto; el PID escribe directamente al hardware.
+#
+#   5. PARÁMETROS PID AJUSTABLES EN CALIENTE: El original expone kp, ki, kd
+#      como entidades number que se aplican en tiempo real. Aquí se hace lo
+#      mismo, y además se exponen los parámetros de la banda muerta
+#      (threshold_high, threshold_low, ki_multiplier), que en el original
+#      solo se pueden cambiar recompilando.
+#
+#   6. FRAMEWORK ESP-IDF: El original usa el framework Arduino por defecto.
+#      Aquí se usa ESP-IDF, que ofrece mejor gestión de memoria, WiFi más
+#      estable y menor overhead general en ESP32.
+#
+#   7. WEB SERVER CON AUTENTICACIÓN: Se habilita el servidor web integrado
+#      de ESPHome en el puerto 80 con usuario/contraseña, para acceso y
+#      control directo sin necesidad de HA.
+#
+#   8. REINICIO DIARIO PROGRAMADO: El reinicio automático a las 00:30
+#      también existe en el original de Patrick Collins, mantenido tal cual.
+#      Ver comentario en la sección 'time' para consideraciones sobre esta
+#      decisión.
+#
+# CORRECCIONES RESPECTO A LA VERSIÓN ANTERIOR DE ESTE ARCHIVO:
+#
+#   A. [BUG] Los number entities de parámetros PID no tenían 'id', por lo
+#      que no era posible referenciarlos en on_boot. Se añaden IDs y un
+#      bloque on_boot que restaura todos los parámetros PID tras reinicio.
+#      Sin esto, tras cada reinicio el PID ignoraba los valores guardados
+#      en NVS (flash) y usaba los valores por defecto del YAML.
+#
+#   B. [BUG] max_integral: 0.0 desactiva el anti-windup del integrador PID,
+#      permitiendo que crezca sin límite cuando la temperatura está por
+#      encima del setpoint durante mucho tiempo. Se cambia a 1.0.
+#
+#   C. [LÓGICA] En el proxy_output en modo manual se usaba
+#      'id(manual_fan_control).speed / 100.0' cuando lo correcto es usar
+#      'state' directamente (el valor ya viene correctamente normalizado
+#      desde la plataforma fan speed). Usando .speed se podría escribir
+#      un valor incorrecto si hay desfase entre el estado del fan y la
+#      llamada al write_action.
+#
+#   D. [INCONSISTENCIA] Fan1 in_deadband_term tenía 'update_interval: 1.3s'
+#      sin lambda asociada (inútil, pues el valor se publica manualmente
+#      desde on_state). Fan2 no lo tenía. Se elimina para consistencia.
+#
+#   E. [MENOR] min_power/max_power en outputs LEDC eran valores por defecto,
+#      se eliminan para limpiar el YAML (los límites reales se aplican en
+#      el proxy).
+################################################################################
+
+substitutions:
+  friendly_name: Ventilador ARMARIO
+
+################################################################################
+# IDENTIFICACIÓN DEL DISPOSITIVO
+################################################################################
+esphome:
+  name: armario-fan
+  friendly_name: armario-fan
+  min_version: 2025.12.0  # Versión mínima de ESPHome requerida para compilar
+  name_add_mac_suffix: false  # No añadir el sufijo MAC al nombre del dispositivo
+
+  # ── on_boot: RESTAURAR PARÁMETROS PID TRAS REINICIO ────────────────────────
+  # CORRECCIÓN [A]: Los 'number' con restore_value:true recuperan su valor de
+  # la flash NVS al arrancar, pero NO llaman automáticamente al set_action.
+  # Por tanto, aunque el número tenga el valor correcto guardado, el PID
+  # interno del ESP32 NO lo recibe hasta que el usuario lo modifique desde HA.
+  #
+  # Solución: en on_boot con prioridad baja (después de que los 'number' ya
+  # hayan restaurado sus valores), aplicamos explícitamente cada parámetro.
+  # La prioridad -100 garantiza que esto ocurre cuando todos los componentes
+  # ya están inicializados.
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          // ── Ventilador 1 ──
+          id(console_thermostat).set_kp(id(fan1_kp).state);
+          id(console_thermostat).set_ki(id(fan1_ki).state);
+          id(console_thermostat).set_kd(id(fan1_kd).state);
+          id(console_thermostat).set_threshold_high(id(fan1_threshold_high).state);
+          id(console_thermostat).set_threshold_low(id(fan1_threshold_low).state);
+          id(console_thermostat).set_ki_multiplier(id(fan1_ki_multiplier).state);
+
+          // ── Ventilador 2 ──
+          id(console_thermostat2).set_kp(id(fan2_kp).state);
+          id(console_thermostat2).set_ki(id(fan2_ki).state);
+          id(console_thermostat2).set_kd(id(fan2_kd).state);
+          id(console_thermostat2).set_threshold_high(id(fan2_threshold_high).state);
+          id(console_thermostat2).set_threshold_low(id(fan2_threshold_low).state);
+          id(console_thermostat2).set_ki_multiplier(id(fan2_ki_multiplier).state);
+
+################################################################################
+# HARDWARE - ESP32
+################################################################################
+esp32:
+  board: esp32dev
+  framework:
+    # ESP-IDF en lugar del framework Arduino (diferencia respecto al original).
+    # Ventajas: mejor gestión de memoria heap, WiFi más estable bajo carga,
+    # menor latencia en tareas concurrentes, y es el framework nativo del ESP32.
+    type: esp-idf
+
+################################################################################
+# CONECTIVIDAD WIFI
+################################################################################
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Punto de acceso de emergencia (captive portal) si no puede conectar al WiFi
+  ap:
+    ssid: !secret captive_ssid
+    password: !secret captive_password
+
+################################################################################
+# SERVIDOR WEB INTEGRADO
+# Se habilita el servidor web integrado de ESPHome en el puerto 80 con
+# autenticación básica HTTP. Permite controlar el dispositivo desde el
+# navegador sin pasar por HA. Útil para depuración o si HA no está disponible.
+################################################################################
+web_server:
+  port: 80
+  auth:
+    username: !secret web_server_user
+    password: !secret web_server_password
+
+# Si el WiFi falla y el AP está activo, el captive portal redirige al usuario
+# a la interfaz de configuración web.
+captive_portal:
+
+################################################################################
+# LOGGER
+# baud_rate: 0 deshabilita el log por puerto serie (UART).
+# En producción esto ahorra energía y evita interferencias. Los logs siguen
+# disponibles a través de la API de ESPHome y del web server.
+################################################################################
+logger:
+  baud_rate: 0
+
+################################################################################
+# API HOME ASSISTANT
+# Cifrado AES-128 para la comunicación con HA. La clave es un secreto Base64.
+################################################################################
+api:
+  encryption:
+    key: !secret base64
+
+################################################################################
+# OTA (Over The Air updates)
+# Permite actualizar el firmware sin conexión física al ESP32.
+################################################################################
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+################################################################################
+# ENTIDADES NUMBER - PARÁMETROS CONFIGURABLES
+#
+# Todas estas entidades se persisten en la flash NVS (restore_value: true) y
+# son accesibles desde HA. Permiten ajustar el comportamiento del sistema en
+# tiempo real sin recompilar el firmware.
+#
+# Diferencia respecto al original: el original solo expone kp, ki, kd.
+# Aquí también se exponen los parámetros de la banda muerta (deadband) para
+# ambos ventiladores, y los límites de velocidad en modo automático.
+################################################################################
+number:
+
+  # ── VENTILADOR 1 - Límites de velocidad en modo automático ─────────────────
+  # En modo manual el ventilador puede ir de 0 a 100%. En modo automático
+  # (PID), estos límites restringen el rango de actuación. Esto evita que el
+  # ventilador vaya demasiado lento (haciendo ruido de rozamiento) o
+  # demasiado rápido (haciendo ruido aerodinámico innecesario).
+  - platform: template
+    name: Fan1 Velocidad Mínima Auto
+    id: fan1_min_auto
+    icon: mdi:speedometer-slow
+    restore_value: true
+    initial_value: 13   # 13% = velocidad mínima para que el motor gire de forma estable
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    optimistic: true    # No hay feedback hardware; el valor se acepta directamente
+
+  - platform: template
+    name: Fan1 Velocidad Máxima Auto
+    id: fan1_max_auto
+    icon: mdi:speedometer
+    restore_value: true
+    initial_value: 60   # 60% = techo para no generar demasiado ruido en automático
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    optimistic: true
+
+  # ── VENTILADOR 2 - Límites de velocidad en modo automático ─────────────────
+  - platform: template
+    name: Fan2 Velocidad Mínima Auto
+    id: fan2_min_auto
+    icon: mdi:speedometer-slow
+    restore_value: true
+    initial_value: 13
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    optimistic: true
+
+  - platform: template
+    name: Fan2 Velocidad Máxima Auto
+    id: fan2_max_auto
+    icon: mdi:speedometer
+    restore_value: true
+    initial_value: 60
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    optimistic: true
+
+  # ── VENTILADOR 1 - Parámetros PID ──────────────────────────────────────────
+  #
+  # El controlador PID calcula: output = kp*error + ki*∫error·dt + kd*d(error)/dt
+  #
+  # Para un ventilador de armario (sistema térmico lento), la experiencia del
+  # proyecto original indica que kp y ki son los relevantes; kd puede dejarse
+  # a 0 ya que el ruido del sensor amplificaría el término derivativo.
+  #
+  # Los set_action aplican el nuevo valor directamente al PID en tiempo real.
+  # CORRECCIÓN [A]: Se añade 'id' a cada número para poder referenciarlos en
+  # on_boot y restaurar los valores tras reinicio.
+
+  - platform: template
+    name: Fan1 kp
+    id: fan1_kp                   # ← ID añadido (corrección A)
+    icon: mdi:chart-bell-curve
+    restore_value: true
+    initial_value: 0.3            # Ganancia proporcional inicial
+    min_value: 0
+    max_value: 50
+    step: 0.001
+    optimistic: true
+    set_action:
+      lambda: id(console_thermostat).set_kp( x );
+
+  - platform: template
+    name: Fan1 ki
+    id: fan1_ki                   # ← ID añadido (corrección A)
+    icon: mdi:chart-bell-curve
+    restore_value: true
+    initial_value: 0.0015         # Ganancia integral inicial (muy pequeña = reacción lenta y suave)
+    min_value: 0
+    max_value: 50
+    step: 0.0001
+    optimistic: true
+    set_action:
+      lambda: id(console_thermostat).set_ki( x );
+
+  - platform: template
+    name: Fan1 kd
+    id: fan1_kd                   # ← ID añadido (corrección A)
+    icon: mdi:chart-bell-curve
+    restore_value: true
+    initial_value: 0.0            # Derivativo desactivado (ver nota arriba)
+    min_value: -50
+    max_value: 50
+    step: 0.001
+    optimistic: true
+    set_action:
+      lambda: id(console_thermostat).set_kd( x );
+
+  - platform: template
+    name: Fan1 Umbral inferior de zona muerta
+    id: fan1_threshold_low        # ← ID añadido (corrección A)
+    icon: mdi:chart-bell-curve
+    restore_value: true
+    # La banda muerta (deadband) define una zona alrededor del setpoint donde
+    # el PID reduce su agresividad. Si la temperatura está entre
+    # (setpoint + threshold_low) y (setpoint + threshold_high), se aplica
+    # el multiplicador ki_multiplier en lugar del ki normal.
+    # threshold_low = -1.0 significa: si temp < setpoint - 1°C, salimos de
+    # la banda muerta por abajo.
+    initial_value: -1.0
+    min_value: -20
+    max_value: 0
+    step: 0.1
+    optimistic: true
+    set_action:
+      lambda: id(console_thermostat).set_threshold_low( x );
+
+  - platform: template
+    name: Fan1 Umbral superior de zona muerta
+    id: fan1_threshold_high       # ← ID añadido (corrección A)
+    icon: mdi:chart-bell-curve
+    restore_value: true
+    # threshold_high = 0.4 significa: si temp > setpoint + 0.4°C, salimos
+    # de la banda muerta por arriba y el PID actúa con fuerza total.
+    initial_value: 0.4
+    min_value: 0
+    max_value: 20
+    step: 0.1
+    optimistic: true
+    set_action:
+      lambda: id(console_thermostat).set_threshold_high( x );
+
+  - platform: template
+    name: Fan1 Multiplicador ki de zona muerta
+    id: fan1_ki_multiplier        # ← ID añadido (corrección A)
+    icon: mdi:chart-bell-curve
+    restore_value: true
+    # Dentro de la banda muerta, el integrador sigue actuando pero con este
+    # multiplicador aplicado. 0.04 = 4% del ki normal → acción integral
+    # mínima para mantener la posición sin oscilaciones.
+    initial_value: 0.04
+    min_value: 0
+    max_value: 0.2
+    step: 0.01
+    optimistic: true
+    set_action:
+      lambda: id(console_thermostat).set_ki_multiplier( x );
+
+  # ── VENTILADOR 2 - Parámetros PID ──────────────────────────────────────────
+  # Idéntica estructura al Fan1. Ambos ventiladores comparten sensor de
+  # temperatura pero sus PIDs son completamente independientes, por lo que
+  # cada uno puede tener un ajuste diferente si fuera necesario.
+
+  - platform: template
+    name: Fan2 kp
+    id: fan2_kp                   # ← ID añadido (corrección A)
+    icon: mdi:chart-bell-curve
+    restore_value: true
+    initial_value: 0.3
+    min_value: 0
+    max_value: 50
+    step: 0.001
+    optimistic: true
+    set_action:
+      lambda: id(console_thermostat2).set_kp( x );
+
+  - platform: template
+    name: Fan2 ki
+    id: fan2_ki                   # ← ID añadido (corrección A)
+    icon: mdi:chart-bell-curve
+    restore_value: true
+    initial_value: 0.0015
+    min_value: 0
+    max_value: 50
+    step: 0.0001
+    optimistic: true
+    set_action:
+      lambda: id(console_thermostat2).set_ki( x );
+
+  - platform: template
+    name: Fan2 kd
+    id: fan2_kd                   # ← ID añadido (corrección A)
+    icon: mdi:chart-bell-curve
+    restore_value: true
+    initial_value: 0.0
+    min_value: -50
+    max_value: 50
+    step: 0.001
+    optimistic: true
+    set_action:
+      lambda: id(console_thermostat2).set_kd( x );
+
+  - platform: template
+    name: Fan2 Umbral inferior de zona muerta
+    id: fan2_threshold_low        # ← ID añadido (corrección A)
+    icon: mdi:chart-bell-curve
+    restore_value: true
+    initial_value: -1.0
+    min_value: -20
+    max_value: 0
+    step: 0.1
+    optimistic: true
+    set_action:
+      lambda: id(console_thermostat2).set_threshold_low( x );
+
+  - platform: template
+    name: Fan2 Umbral superior de zona muerta
+    id: fan2_threshold_high       # ← ID añadido (corrección A)
+    icon: mdi:chart-bell-curve
+    restore_value: true
+    initial_value: 0.4
+    min_value: 0
+    max_value: 20
+    step: 0.1
+    optimistic: true
+    set_action:
+      lambda: id(console_thermostat2).set_threshold_high( x );
+
+  - platform: template
+    name: Fan2 Multiplicador ki de zona muerta
+    id: fan2_ki_multiplier        # ← ID añadido (corrección A)
+    icon: mdi:chart-bell-curve
+    restore_value: true
+    initial_value: 0.04
+    min_value: 0
+    max_value: 0.2
+    step: 0.01
+    optimistic: true
+    set_action:
+      lambda: id(console_thermostat2).set_ki_multiplier( x );
+
+################################################################################
+# SENSORES DE TEXTO
+################################################################################
+text_sensor:
+  # IP actual del dispositivo (útil para saber dónde acceder al web server)
+  - platform: wifi_info
+    ip_address:
+      name: $friendly_name IP
+
+  # Uptime en formato legible (p.ej. "2d 4h 13m 7s")
+  # Se publica manualmente desde el sensor de uptime numérico (ver más abajo)
+  - platform: template
+    name: $friendly_name Uptime
+    id: uptime_human
+    icon: mdi:clock-start
+
+################################################################################
+# SENSORES
+################################################################################
+sensor:
+
+  # ── SENSORES IMPORTADOS DESDE HOME ASSISTANT ───────────────────────────────
+  # Diferencia respecto al original: en lugar de usar un DHT11 local, se
+  # importan los datos de un sensor ya existente en HA (el protocolo concreto
+  # del sensor es independiente de este firmware; ESPHome solo ve la entidad HA).
+  # Ventaja: reutiliza infraestructura existente, no requiere cablear un
+  # sensor al ESP32. Inconveniente: dependencia de HA; si HA cae, el ESP32
+  # pierde la referencia de temperatura y el PID puede comportarse de forma
+  # impredecible (congelará el último valor conocido).
+
+  - platform: homeassistant
+    id: console_fan_temperature
+    entity_id: sensor.humedad_armario_00_01_00_vestidor_casa_grande_temperature
+    internal: false  # Se expone también como entidad en ESPHome (visible en web server y API)
+
+  - platform: homeassistant
+    id: console_fan_humidity
+    entity_id: sensor.humedad_armario_00_01_00_vestidor_casa_grande_humidity
+    internal: false  # La humedad no se usa en el PID pero es útil para monitorización
+
+  # ── DIAGNÓSTICO DEL DISPOSITIVO ────────────────────────────────────────────
+
+  - platform: wifi_signal
+    name: $friendly_name Fuerza de la WiFi
+    update_interval: 60s  # Se mide y publica cada minuto
+
+  - platform: uptime
+    name: $friendly_name Uptime
+    id: uptime_sensor
+    update_interval: 60s
+    on_raw_value:
+      # Cada vez que se actualiza el uptime numérico (en segundos), calculamos
+      # la representación legible y la publicamos en el text_sensor uptime_human
+      then:
+        - text_sensor.template.publish:
+            id: uptime_human
+            state: !lambda |-
+              int seconds = round(id(uptime_sensor).raw_state);
+              int days    = seconds / (24 * 3600);
+              seconds     = seconds % (24 * 3600);
+              int hours   = seconds / 3600;
+              seconds     = seconds % 3600;
+              int minutes = seconds / 60;
+              seconds     = seconds % 60;
+              return (
+                (days    ? to_string(days)    + "d " : "") +
+                (hours   ? to_string(hours)   + "h " : "") +
+                (minutes ? to_string(minutes) + "m " : "") +
+                (to_string(seconds) + "s")
+              ).c_str();
+
+  # ── VENTILADOR 1 - RPM (tacómetro) ─────────────────────────────────────────
+  # El ventilador genera pulsos en el pin TACH (pin 3 del conector PWM de 4 pines).
+  # El ESP32 los cuenta con pulse_counter. Los ventiladores PWM de PC generan
+  # típicamente 2 pulsos por revolución → multiplicar por 0.5 da RPM directas.
+  - platform: pulse_counter
+    pin:
+      number: GPIO25
+      mode: INPUT_PULLUP  # Pull-up interno activo (el pin TACH es open-drain)
+    unit_of_measurement: 'RPM'
+    id: fan_speed
+    name: $friendly_name Velocidad del ventilador 1
+    accuracy_decimals: 0
+    filters:
+      - multiply: 0.5   # 2 pulsos/revolución → dividir entre 2 para obtener RPM
+
+  # ── VENTILADOR 2 - RPM ─────────────────────────────────────────────────────
+  - platform: pulse_counter
+    pin:
+      number: GPIO26
+      mode: INPUT_PULLUP
+    unit_of_measurement: 'RPM'
+    id: fan2_speed
+    name: $friendly_name Velocidad del ventilador 2
+    accuracy_decimals: 0
+    filters:
+      - multiply: 0.5
+
+  # ── VENTILADOR 1 - Diagnóstico interno del PID ─────────────────────────────
+  # Estos sensores template no tienen update_interval porque se actualizan
+  # exclusivamente desde el on_state del clima PID (event-driven).
+  # Permiten ver en HA qué está haciendo internamente el controlador.
+  #
+  # NOTA: Los valores se invierten (negados) porque ESPHome PID usa la
+  # convención "cooling output" donde un error positivo (temp > setpoint)
+  # produce una salida positiva, pero internamente el término proporcional
+  # se calcula como negativo. Al negar, obtenemos valores intuitivos en HA
+  # (número positivo = ventilador más rápido).
+
+  - platform: template
+    name: Fan1 término p
+    id: p_term
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+
+  - platform: template
+    name: Fan1 término i
+    id: i_term
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+
+  - platform: template
+    name: Fan1 término d
+    id: d_term
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+
+  - platform: template
+    name: Fan1 Valor de salida
+    unit_of_measurement: "%"
+    id: o_term
+    accuracy_decimals: 2
+
+  - platform: template
+    name: Fan1 Valor del error
+    id: e_term        # Error = temperatura_actual - temperatura_objetivo
+    accuracy_decimals: 2
+
+  - platform: template
+    name: Fan1 está en la banda muerta
+    id: in_deadband_term
+    accuracy_decimals: 0
+    # CORRECCIÓN [D]: Se elimina update_interval: 1.3s que existía aquí pero
+    # no en Fan2. Era inútil porque este sensor no tiene lambda de actualización
+    # propia; su valor se publica exclusivamente desde el on_state del PID.
+    # Tenerlo generaba una actualización espuria con el valor anterior cada
+    # 1.3 segundos, lo que podía confundir en los gráficos de HA.
+
+  - platform: template
+    name: "Velocidad del ventilador 1 (PWM)"
+    unit_of_measurement: "%"
+    id: fan_speed_pwm_voltage
+    # Publica el duty cycle real enviado al ventilador (0-100%)
+    # Se actualiza desde el proxy_output cada vez que cambia la velocidad
+
+  # ── VENTILADOR 2 - Diagnóstico interno del PID ─────────────────────────────
+  # Estructura simétrica a Fan1
+
+  - platform: template
+    name: Fan2 término p
+    id: p_term2
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+
+  - platform: template
+    name: Fan2 término i
+    id: i_term2
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+
+  - platform: template
+    name: Fan2 término d
+    id: d_term2
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+
+  - platform: template
+    name: Fan2 Valor de salida
+    unit_of_measurement: "%"
+    id: o_term2
+    accuracy_decimals: 2
+
+  - platform: template
+    name: Fan2 Valor del error
+    id: e_term2
+    accuracy_decimals: 2
+
+  - platform: template
+    name: Fan2 está en la banda muerta
+    id: in_deadband_term2
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Velocidad del ventilador 2 (PWM)"
+    unit_of_measurement: "%"
+    id: fan2_speed_pwm_voltage
+
+################################################################################
+# OUTPUTS HARDWARE Y PROXY
+#
+# Arquitectura (diferencia clave respecto al original):
+#
+#   [PID / Fan manual] → [proxy_output (template)] → [ledc output] → [Pin GPIO]
+#
+# En el original es directo: [PID / Fan manual] → [ledc output] → [Pin GPIO]
+#
+# El proxy intercepta la escritura y decide el valor final según el modo:
+#   - Modo MANUAL (fan entity encendido): escribe directamente lo que el
+#     usuario ha pedido (state), sin restricciones.
+#   - Modo AUTOMÁTICO (fan entity apagado, PID activo): aplica los límites
+#     min/max configurables antes de escribir al hardware.
+################################################################################
+output:
+
+  # ── VENTILADOR 1 - Output PWM hardware ─────────────────────────────────────
+  # LEDC = LED Control (el periférico PWM del ESP32, no solo para LEDs).
+  # 25 kHz es la frecuencia estándar para ventiladores PWM de PC (spec Intel).
+  # CORRECCIÓN [E]: Se eliminan min_power: 0% y max_power: 100% porque son
+  # los valores por defecto. Los límites reales se aplican en el proxy.
+  - platform: ledc
+    id: console_fan_speed
+    pin: GPIO13
+    frequency: "25000 Hz"   # 25 kHz: frecuencia estándar PWM para ventiladores de PC
+    zero_means_zero: true   # Cuando se pide 0%, el duty cycle es realmente 0%
+                            # (sin esto, algunos ledc emiten una señal mínima residual)
+
+  # ── VENTILADOR 2 - Output PWM hardware ─────────────────────────────────────
+  - platform: ledc
+    id: console_fan2_speed
+    pin: GPIO14
+    frequency: "25000 Hz"
+    zero_means_zero: true
+
+  # ── VENTILADOR 1 - Proxy output ─────────────────────────────────────────────
+  # Este output template actúa como intermediario entre el PID/fan-entity y el
+  # hardware LEDC. Su write_action se ejecuta cada vez que el PID o el control
+  # manual quiere cambiar la velocidad.
+  #
+  # 'state' aquí es el valor (0.0 a 1.0) que el caller (PID o fan platform)
+  # quiere escribir.
+  - platform: template
+    id: proxy_output
+    type: float
+    write_action:
+      lambda: |-
+        float write_val;
+
+        if (id(manual_fan_control).state) {
+          // ── MODO MANUAL ──
+          // El fan entity está encendido: el usuario controla la velocidad.
+          // CORRECCIÓN [C]: Se usa 'state' directamente (valor ya normalizado
+          // 0.0-1.0 que la plataforma speed fan ha calculado) en lugar de
+          // 'id(manual_fan_control).speed / 100.0'.
+          // Razón: cuando el fan se apaga (.state pasa a false), el valor de
+          // .speed puede conservar el último valor no-cero, mientras que
+          // 'state' siempre refleja exactamente lo que el caller quiere escribir.
+          write_val = state;
+
+        } else {
+          // ── MODO AUTOMÁTICO (PID) ──
+          // Aplicar límites configurables desde HA.
+          // Esto permite acotar el rango de actuación del PID sin modificar
+          // los parámetros del controlador: útil para garantizar un mínimo
+          // de refrigeración o evitar ruido excesivo.
+          float min_val = id(fan1_min_auto).state / 100.0;
+          float max_val = id(fan1_max_auto).state / 100.0;
+          float pid_output = state;  // Salida del PID (0.0 a 1.0)
+
+          if (pid_output < min_val) {
+            write_val = min_val;      // No bajar del mínimo configurado
+          } else if (pid_output > max_val) {
+            write_val = max_val;      // No superar el máximo configurado
+          } else {
+            write_val = pid_output;   // Dentro del rango: valor PID directo
+          }
+        }
+
+        // Escribir al hardware
+        id(console_fan_speed).set_level(write_val);
+        // Publicar el duty cycle real para monitorización en HA
+        id(fan_speed_pwm_voltage).publish_state(write_val * 100.0);
+
+  # ── VENTILADOR 2 - Proxy output ─────────────────────────────────────────────
+  # Estructura idéntica al proxy del Fan1 pero referenciando los IDs del Fan2.
+  - platform: template
+    id: proxy_output2
+    type: float
+    write_action:
+      lambda: |-
+        float write_val;
+
+        if (id(manual_fan2_control).state) {
+          // ── MODO MANUAL ──
+          // CORRECCIÓN [C]: Se usa 'state' directamente (ver comentario Fan1)
+          write_val = state;
+
+        } else {
+          // ── MODO AUTOMÁTICO (PID) ──
+          float min_val = id(fan2_min_auto).state / 100.0;
+          float max_val = id(fan2_max_auto).state / 100.0;
+          float pid_output = state;
+
+          if (pid_output < min_val) {
+            write_val = min_val;
+          } else if (pid_output > max_val) {
+            write_val = max_val;
+          } else {
+            write_val = pid_output;
+          }
+        }
+
+        id(console_fan2_speed).set_level(write_val);
+        id(fan2_speed_pwm_voltage).publish_state(write_val * 100.0);
+
+################################################################################
+# FAN ENTITIES - CONTROL MANUAL
+#
+# La plataforma 'speed' crea una entidad fan en HA con control de velocidad
+# de 0 a 100%. Cuando está encendida, escribe al proxy_output y el proxy
+# detecta el modo manual. Cuando está apagada, el PID toma el control.
+#
+# Diferencia respecto al original: en el original hay un único fan entity.
+# Aquí hay dos, uno por ventilador, completamente independientes.
+################################################################################
+fan:
+  # Ventilador 1 - modo manual (rango completo 0-100%)
+  - platform: speed
+    id: manual_fan_control
+    output: proxy_output
+    name: "Velocidad manual del ventilador 1"
+
+  # Ventilador 2 - modo manual (rango completo 0-100%)
+  - platform: speed
+    id: manual_fan2_control
+    output: proxy_output2
+    name: "Velocidad manual del ventilador 2"
+
+################################################################################
+# CLIMATE - CONTROLADORES PID
+#
+# El controlador PID de ESPHome implementa un lazo de control que:
+#   1. Lee la temperatura del sensor
+#   2. Compara con el setpoint (target temperature)
+#   3. Calcula una señal de control (0.0 a 1.0) mediante la fórmula PID
+#   4. La escribe en el cool_output (nuestro proxy)
+#
+# Se usa 'cool_output' (y no 'heat_output') porque queremos más velocidad
+# cuando la temperatura SUBE (enfriamiento activo).
+#
+# Diferencia respecto al original: el original tiene un único PID.
+# Aquí hay dos PIDs independientes con los mismos parámetros iniciales,
+# cada uno controlando su propio ventilador a través de su propio proxy.
+################################################################################
+climate:
+
+  # ── VENTILADOR 1 - Controlador PID ─────────────────────────────────────────
+  - platform: pid
+    name: "Ventilador 1 Termostato"
+    id: console_thermostat
+    sensor: console_fan_temperature
+    default_target_temperature: 30°C   # Temperatura objetivo inicial; el usuario puede cambiarlo desde HA
+
+    # El PID escribe en el proxy, que aplicará límites y escribirá al LEDC
+    cool_output: proxy_output
+
+    # on_state se dispara cada vez que el PID recalcula su salida.
+    # Aquí publicamos todos los términos internos como sensores para
+    # poder monitorizar el comportamiento del controlador en HA.
+    on_state:
+      - sensor.template.publish:
+          id: p_term
+          state: !lambda 'return -id(console_thermostat).get_proportional_term() * 100.0;'
+      - sensor.template.publish:
+          id: i_term
+          state: !lambda 'return -id(console_thermostat).get_integral_term() * 100.0;'
+      - sensor.template.publish:
+          id: d_term
+          state: !lambda 'return -id(console_thermostat).get_derivative_term() * 100.0;'
+      - sensor.template.publish:
+          id: o_term
+          state: !lambda 'return -id(console_thermostat).get_output_value() * 100.0;'
+      - sensor.template.publish:
+          id: in_deadband_term
+          state: !lambda 'return id(console_thermostat).in_deadband();'
+      - sensor.template.publish:
+          id: e_term
+          state: !lambda 'return -id(console_thermostat).get_error_value();'
+
+    visual:
+      min_temperature: 20 °C    # Rango mínimo del slider en HA
+      max_temperature: 50 °C    # Rango máximo del slider en HA
+
+    control_parameters:
+      kp: 0.3          # Ganancia proporcional: respuesta inmediata al error
+      ki: 0.0015       # Ganancia integral: corrige el error acumulado lentamente
+      kd: 0            # Derivativa: desactivada (amplificaría ruido del sensor)
+      # CORRECCIÓN [B]: max_integral cambiado de 0.0 a 1.0
+      # Con 0.0 el anti-windup estaba desactivado: el integrador podía crecer
+      # sin límite si la temperatura estaba mucho tiempo sobre el setpoint
+      # (p.ej. puerta abierta). Al volver a la normalidad, el ventilador tardaba
+      # mucho en bajar la velocidad ("integral windup"). 1.0 limita el acumulado
+      # al equivalente de la salida máxima.
+      max_integral: 1.0
+      # NOTA: output_averaging_samples: 1 = sin promediado de salida.
+      # Con 1 muestra no hay suavizado; cada cálculo PID se aplica directamente.
+      # Si se quiere suavizar la respuesta del ventilador (transiciones más
+      # lentas y silenciosas), aumentar a 3-5.
+      output_averaging_samples: 1
+      derivative_averaging_samples: 5  # Promedia 5 muestras para el término D (reduce ruido)
+
+    deadband_parameters:
+      # La banda muerta reduce la agresividad del PID cuando la temperatura
+      # está "cerca" del setpoint, evitando micro-ajustes constantes de velocidad
+      # que resultarían en ruido audible del ventilador.
+      #
+      # Zona de banda muerta: [setpoint - 1.0°C , setpoint + 0.4°C]
+      # → Dentro de esta zona, kp=0 y ki se multiplica por 0.04 (4% del normal)
+      # → Fuera de esta zona, el PID actúa con parámetros normales
+      threshold_high: 0.4°C       # Temp puede subir 0.4°C sobre el objetivo sin reacción fuerte
+      threshold_low: -1.0°C       # Temp puede bajar 1.0°C bajo el objetivo sin reacción fuerte
+      kp_multiplier: 0.0          # Dentro de la banda: ganancia proporcional = 0 (sin reacción P)
+      ki_multiplier: 0.04         # Dentro de la banda: 4% de la ganancia integral normal
+      kd_multiplier: 0.0          # Dentro de la banda: derivativa también desactivada
+      deadband_output_averaging_samples: 15  # Promedia más muestras dentro de la banda para mayor suavidad
+
+  # ── VENTILADOR 2 - Controlador PID ─────────────────────────────────────────
+  # Configuración simétrica al Fan1. Ambos PIDs leen el mismo sensor de
+  # temperatura pero actúan sobre sus respectivos proxies/motores de forma
+  # completamente independiente.
+  - platform: pid
+    name: "Ventilador 2 Termostato"
+    id: console_thermostat2
+    sensor: console_fan_temperature
+    default_target_temperature: 30°C
+    cool_output: proxy_output2
+
+    on_state:
+      - sensor.template.publish:
+          id: p_term2
+          state: !lambda 'return -id(console_thermostat2).get_proportional_term() * 100.0;'
+      - sensor.template.publish:
+          id: i_term2
+          state: !lambda 'return -id(console_thermostat2).get_integral_term() * 100.0;'
+      - sensor.template.publish:
+          id: d_term2
+          state: !lambda 'return -id(console_thermostat2).get_derivative_term() * 100.0;'
+      - sensor.template.publish:
+          id: o_term2
+          state: !lambda 'return -id(console_thermostat2).get_output_value() * 100.0;'
+      - sensor.template.publish:
+          id: in_deadband_term2
+          state: !lambda 'return id(console_thermostat2).in_deadband();'
+      - sensor.template.publish:
+          id: e_term2
+          state: !lambda 'return -id(console_thermostat2).get_error_value();'
+
+    visual:
+      min_temperature: 20 °C
+      max_temperature: 50 °C
+
+    control_parameters:
+      kp: 0.3
+      ki: 0.0015
+      kd: 0
+      max_integral: 1.0           # CORRECCIÓN [B]: igual que Fan1
+      output_averaging_samples: 1
+      derivative_averaging_samples: 5
+
+    deadband_parameters:
+      threshold_high: 0.4°C
+      threshold_low: -1.0°C
+      kp_multiplier: 0.0
+      ki_multiplier: 0.04
+      kd_multiplier: 0.0
+      deadband_output_averaging_samples: 15
+
+################################################################################
+# SWITCH - REINICIO MANUAL
+################################################################################
+switch:
+  - platform: restart
+    name: ${friendly_name} Reiniciar ESP32
+    id: console_fan_restart
+
+################################################################################
+# TIME - REINICIO DIARIO PROGRAMADO
+#
+# Esta sección existe también en el original de Patrick Collins, mantenida
+# tal cual (misma hora: 00:30).
+#
+# ADVERTENCIA: Un reinicio diario forzado en un controlador de temperatura
+# introduce las siguientes consideraciones:
+#
+#   PRO: Libera posibles leaks de memoria acumulados, reinicia conexiones WiFi
+#        degradadas, y garantiza que el dispositivo arranque limpio.
+#
+#   CONTRA:
+#     1. Interrumpe el control térmico durante el arranque (típicamente 5-15s).
+#     2. El integrador PID (estado del sistema) se pierde y tarda en
+#        converger de nuevo, pudiendo causar una breve oscilación.
+#     3. Si HA no está disponible en ese momento, el sensor de tiempo
+#        homeassistant no estará sincronizado y el trigger podría no dispararse.
+#     4. Si el armario está caliente en ese momento, hay una breve ventana
+#        sin refrigeración activa.
+#
+# Si no hay un motivo técnico concreto (leak de memoria conocido, etc.),
+# se recomienda eliminar este bloque y confiar en la estabilidad del firmware.
+# Si se mantiene, considerar una hora de menor impacto (p.ej. 4:00 AM).
+################################################################################
+time:
+  - platform: homeassistant  # Sincroniza la hora desde HA (requiere HA disponible)
+    on_time:
+      - seconds: 0
+        minutes: 30
+        hours: 0        # Reinicio diario a las 00:30
+        then:
+          - switch.turn_on: console_fan_restart
